@@ -5,6 +5,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { io } from 'socket.io-client';
 import { Link, useLocation } from 'react-router-dom';
 import { detectFace, cleanup } from '../lib/faceDetection';
+import { detectEyeMetrics, cleanupEyeTracker } from '../lib/eyeTracking';
+import type { GazeDirection } from '../lib/eyeTracking';
 import { detectAIContent, checkPlagiarism } from '../lib/gemini';
 import { GaussianDFTAudioDetectorFast } from '../lib/AudioDetectorFast';
 import { Line } from 'react-chartjs-2';
@@ -62,6 +64,7 @@ export function ExamSession() {
   );
   
   const webcamRef = useRef<Webcam>(null);
+  const activityListRef = useRef<HTMLDivElement>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [isAutomatedContentDetected, setIsAutomatedContentDetected] = useState(false);
   const [faceDetected, setFaceDetected] = useState(false);
@@ -78,6 +81,14 @@ export function ExamSession() {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [faceDetectionInterval, setFaceDetectionInterval] = useState<NodeJS.Timeout | null>(null);
+  // Eye tracking states
+  const [gazeDirection, setGazeDirection] = useState<GazeDirection | null>(null);
+  const [blinkCount, setBlinkCount] = useState(0);
+  const [prevBlinkLeft, setPrevBlinkLeft] = useState(false);
+  const [prevBlinkRight, setPrevBlinkRight] = useState(false);
+  const [awayConsecutiveSeconds, setAwayConsecutiveSeconds] = useState(0);
+  const [gazeAwayEvents, setGazeAwayEvents] = useState(0);
+  const [lastGazeAlertTime, setLastGazeAlertTime] = useState(0);
   
   // Audio recording states
   const [audioRecorder, setAudioRecorder] = useState<MediaRecorder | null>(null);
@@ -98,8 +109,17 @@ export function ExamSession() {
         clearInterval(faceDetectionInterval);
       }
       cleanup();
+      cleanupEyeTracker();
     };
   }, [examStarted, examCompleted, faceDetectionInterval]);
+
+  // Keep Activity Monitor scrolled to the latest entry
+  useEffect(() => {
+    const el = activityListRef.current;
+    if (!el) return;
+    // Scroll to bottom on warnings update
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [warnings]);
 
   useEffect(() => {
     if (examStarted && timeLeft > 0 && !examCompleted) {
@@ -187,7 +207,11 @@ export function ExamSession() {
     if (hasWebcamAccess && examStarted && !examCompleted) {
       const interval = setInterval(async () => {
         if (webcamRef.current?.video && !examCompleted) {
-          const result = await detectFace(webcamRef.current.video);
+          const videoEl = webcamRef.current.video as HTMLVideoElement;
+          if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) {
+            return;
+          }
+          const result = await detectFace(videoEl);
           
           if (!result.faceDetected && faceDetected) {
             setOutOfFrameCount(prev => prev + 1);
@@ -213,6 +237,34 @@ export function ExamSession() {
           }
           
           setFaceDetected(result.faceDetected);
+
+          // Eye tracking (blink/gaze) sampling with smoothing
+          const eye = await detectEyeMetrics(videoEl);
+          if (eye) {
+            setGazeDirection(eye.gaze);
+            // Blink detection: count on rising edge per eye
+            if ((eye.blinkLeft && !prevBlinkLeft) || (eye.blinkRight && !prevBlinkRight)) {
+              setBlinkCount((c) => c + 1);
+            }
+            setPrevBlinkLeft(eye.blinkLeft);
+            setPrevBlinkRight(eye.blinkRight);
+
+            const isAway = eye.gaze === 'left' || eye.gaze === 'right' || eye.gaze === 'down';
+            setAwayConsecutiveSeconds((sec) => {
+              const next = isAway ? sec + 1 : 0;
+              // Alert if sustained away for >= 4s and last alert > 10s ago
+              if (isAway && next >= 4 && Date.now() - lastGazeAlertTime > 10000) {
+                setLastGazeAlertTime(Date.now());
+                setGazeAwayEvents((e) => e + 1);
+                socket.emit('suspicious-activity', {
+                  type: 'gaze-away',
+                  message: `Sustained gaze away: ${eye.gaze}`
+                });
+                setWarnings((prev) => [...prev, `Sustained gaze away: ${eye.gaze}`]);
+              }
+              return next;
+            });
+          }
         }
       }, 1000);
 
@@ -410,6 +462,13 @@ export function ExamSession() {
         description: 'Face not detected in camera frame',
         timestamp: new Date()
       },
+      {
+        type: 'Gaze Away',
+        count: gazeAwayEvents,
+        severity: gazeAwayEvents > 5 ? 'high' : gazeAwayEvents > 2 ? 'medium' : 'low',
+        description: 'Repeated sustained gaze away from screen',
+        timestamp: new Date()
+      },
   ...(contentAnomaly ? [contentAnomaly] : []),
       ...(audioAnomaly ? [audioAnomaly] : [])
     ];
@@ -424,7 +483,9 @@ export function ExamSession() {
   aiDetected: isAutomatedContentDetected,
       phoneUsage: phoneUsageCount,
       outOfFrame: outOfFrameCount,
-      audioAnalysis: audioAnalysisResult
+      audioAnalysis: audioAnalysisResult,
+      gazeAwayEvents,
+      blinkCount
     };
     const existingResults = JSON.parse(localStorage.getItem('examResults') || '[]');
     localStorage.setItem('examResults', JSON.stringify([examResult, ...existingResults]));
@@ -794,7 +855,7 @@ export function ExamSession() {
               <span>Activity Monitor</span>
             </h3>
           </div>
-          <div className="p-4 space-y-4 max-h-[300px] overflow-y-auto">
+          <div ref={activityListRef} className="p-4 space-y-4 max-h-[300px] overflow-y-auto">
             <AnimatePresence>
               {!faceDetected && (
                 <motion.div
@@ -852,6 +913,35 @@ export function ExamSession() {
                 </motion.div>
               )}
             </AnimatePresence>
+          </div>
+        </motion.div>
+
+        {/* Eye Tracking Status */}
+        <motion.div
+          className="bg-white rounded-3xl shadow-xl border border-gray-200"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.3 }}
+        >
+          <div className="p-4 border-b border-gray-100">
+            <h3 className="font-semibold text-gray-900 flex items-center space-x-2">
+              <Eye className="w-5 h-5 text-blue-600" />
+              <span>Eye Tracking</span>
+            </h3>
+          </div>
+          <div className="p-4 grid grid-cols-3 gap-4 text-sm">
+            <div className="bg-gray-50 rounded-xl p-3 text-center">
+              <p className="text-gray-500">Gaze</p>
+              <p className="font-semibold text-gray-900">{gazeDirection ?? '—'}</p>
+            </div>
+            <div className="bg-gray-50 rounded-xl p-3 text-center">
+              <p className="text-gray-500">Blinks</p>
+              <p className="font-semibold text-gray-900">{blinkCount}</p>
+            </div>
+            <div className="bg-gray-50 rounded-xl p-3 text-center">
+              <p className="text-gray-500">Away streak</p>
+              <p className="font-semibold text-gray-900">{awayConsecutiveSeconds}s</p>
+            </div>
           </div>
         </motion.div>
 
