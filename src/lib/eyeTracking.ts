@@ -57,7 +57,7 @@ function inferGaze(res: FaceLandmarkerResult): GazeDirection {
     getBlendshapeScore(res, 'eyeLookDownLeft') + getBlendshapeScore(res, 'eyeLookDownRight');
 
   const maxVal = Math.max(lookLeft, lookRight, lookUp, lookDown);
-  const threshold = 0.7; // slightly stricter confidence for look direction
+  const threshold = 0.6; // lowered to make gaze detection more sensitive
   if (maxVal < threshold) return 'center';
   if (maxVal === lookLeft) return 'left';
   if (maxVal === lookRight) return 'right';

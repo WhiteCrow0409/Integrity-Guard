@@ -77,6 +77,7 @@ export function ExamSession() {
   const [tabSwitchCount, setTabSwitchCount] = useState(0);
   const [outOfFrameCount, setOutOfFrameCount] = useState(0);
   const [phoneUsageCount, setPhoneUsageCount] = useState(0);
+  const [multipleFacesCount, setMultipleFacesCount] = useState(0);
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [submitAttempted, setSubmitAttempted] = useState(false);
@@ -89,6 +90,7 @@ export function ExamSession() {
   const [awayConsecutiveSeconds, setAwayConsecutiveSeconds] = useState(0);
   const [gazeAwayEvents, setGazeAwayEvents] = useState(0);
   const [lastGazeAlertTime, setLastGazeAlertTime] = useState(0);
+  const lastMultiFaceAlertRef = useRef(0);
   
   // Audio recording states
   const [audioRecorder, setAudioRecorder] = useState<MediaRecorder | null>(null);
@@ -221,10 +223,21 @@ export function ExamSession() {
             });
             setFaceDetected(false);
           } else if (result.multipleFaces) {
-            socket.emit('suspicious-activity', {
-              type: 'multiple-faces',
-              message: 'Multiple faces detected'
-            });
+            const now = Date.now();
+            // Throttle multiple-faces alerts to once every 5 seconds
+            if (now - lastMultiFaceAlertRef.current > 5000) {
+              const faces = Array.isArray((result as any).predictions) ? (result as any).predictions.length : undefined;
+              setMultipleFacesCount((c) => c + 1);
+              setWarnings((prev) => [
+                ...prev,
+                `Multiple faces detected${faces && faces > 1 ? ` (${faces})` : ''}`
+              ]);
+              socket.emit('suspicious-activity', {
+                type: 'multiple-faces',
+                message: `Multiple faces detected${faces && faces > 1 ? ` (${faces})` : ''}`
+              });
+              lastMultiFaceAlertRef.current = now;
+            }
           }
 
           if (result.phoneDetected) {
@@ -252,8 +265,8 @@ export function ExamSession() {
             const isAway = eye.gaze === 'left' || eye.gaze === 'right' || eye.gaze === 'down';
             setAwayConsecutiveSeconds((sec) => {
               const next = isAway ? sec + 1 : 0;
-              // Alert if sustained away for >= 4s and last alert > 10s ago
-              if (isAway && next >= 4 && Date.now() - lastGazeAlertTime > 10000) {
+              // Alert if sustained away for >= 2s and last alert > 10s ago
+              if (isAway && next >= 2 && Date.now() - lastGazeAlertTime > 10000) {
                 setLastGazeAlertTime(Date.now());
                 setGazeAwayEvents((e) => e + 1);
                 socket.emit('suspicious-activity', {
@@ -438,7 +451,8 @@ export function ExamSession() {
         description: [
           tabSwitchCount > 0 ? `Tab switching detected (${tabSwitchCount} times).` : '',
           isAutomatedContentDetected ? 'Automated content detected.' : '',
-          audioAnalysisResult && audioAnalysisResult.speechPercentage > 5 ? `Speech detected (${audioAnalysisResult.speechPercentage.toFixed(1)}%).` : '' // Reduced threshold
+          audioAnalysisResult && audioAnalysisResult.speechPercentage > 5 ? `Speech detected (${audioAnalysisResult.speechPercentage.toFixed(1)}%).` : '', // Reduced threshold
+          multipleFacesCount > 0 ? `Multiple faces detected (${multipleFacesCount} time${multipleFacesCount > 1 ? 's' : ''}).` : ''
         ].filter(Boolean).join(' '),
         timestamp: new Date(),
         severity: 'high'
@@ -467,6 +481,13 @@ export function ExamSession() {
         count: gazeAwayEvents,
         severity: gazeAwayEvents > 5 ? 'high' : gazeAwayEvents > 2 ? 'medium' : 'low',
         description: 'Repeated sustained gaze away from screen',
+        timestamp: new Date()
+      },
+      {
+        type: 'Multiple Faces',
+        count: multipleFacesCount,
+        severity: multipleFacesCount > 3 ? 'high' : multipleFacesCount > 1 ? 'medium' : 'low',
+        description: 'Multiple faces detected in camera frame',
         timestamp: new Date()
       },
   ...(contentAnomaly ? [contentAnomaly] : []),
